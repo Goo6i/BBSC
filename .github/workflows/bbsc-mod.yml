@@ -1,0 +1,52 @@
+name: BBSC mod (Windows)
+
+# Builds bbsc.dll and bbsc-launch.exe with BBSC's own emulator/mod/build-mod.cmd. Only its two
+# machine paths change: this runner's Visual Studio instead of "2022\Community", and an output
+# folder in the workspace instead of D:\BBSC\build. Everything else (sources, flags, libraries)
+# is the script as committed.
+on:
+  workflow_dispatch:
+  push:
+    branches: ['ci/**', 'build/**']
+
+permissions:
+  contents: read
+
+jobs:
+  mod:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Submodules the mod build uses (fmt, xbyak)
+        run: git submodule update --init --depth 1 emulator/externals/fmt emulator/externals/xbyak
+
+      - name: build-mod.cmd with this runner's paths
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath
+          if (-not $vs) { throw "no Visual Studio with the clang-cl component on this runner" }
+          $out = Join-Path $env:GITHUB_WORKSPACE 'build'
+          $src = Get-Content emulator/mod/build-mod.cmd -Raw
+          $ci = $src.Replace('C:\Program Files\Microsoft Visual Studio\2022\Community', $vs).Replace('D:\BBSC\build', $out)
+          if ($ci.Contains('D:\BBSC') -or $ci.Contains('2022\Community')) { throw "build-mod.cmd has new machine paths; update this step" }
+          # cmd.exe needs CRLF for its labels (goto fail); the repository may hold LF.
+          $ci = $ci -replace "(?<!`r)`n", "`r`n"
+          Set-Content -Path emulator/mod/ci-build-mod.cmd -Value $ci -Encoding ascii -NoNewline
+          cmd /c emulator\mod\ci-build-mod.cmd
+          $code = $LASTEXITCODE
+          Get-Content (Join-Path $out 'mod-build.log')
+          if ($code -ne 0) { exit $code }
+
+      - name: What was built
+        shell: pwsh
+        run: Get-ChildItem build/mod -File | ForEach-Object { "{0}  {1} bytes  sha256 {2}" -f $_.Name, $_.Length, (Get-FileHash $_.FullName).Hash }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bbsc-mod-${{ github.sha }}
+          path: |
+            build/mod/bbsc.dll
+            build/mod/bbsc-launch.exe
+            build/mod-build.log
+          if-no-files-found: error
