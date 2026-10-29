@@ -40,6 +40,7 @@
 #include "common/singleton.h"
 #include "core/bbsc_memscan.h"
 #include "core/bbsc_persistence.h"
+#include "core/bbsc_role.h"
 #include "core/bbsc_cinematic.h"
 #include "imgui/bbsc_loading_layer.h"
 #include "core/cpu_patches.h"
@@ -9316,6 +9317,139 @@ void PS4_SYSV_ABI BbscSendPhantomHomeHook(u64, const GuestRegisterSnapshot* regi
              GetSessionState(), caller > image_base ? caller - image_base : 0);
 }
 
+// ---- A guest's own role across BBSC's reloads (2026-10-29) --------------------------------------
+// See core/bbsc_role.h for the game code. Test 2026-10-29 (host + 2 guests, Chalice): after the
+// follow warp at 20:00:24 both guests' slots read role 0 (the host's role), and each later
+// departure sent the remaining players home 5 s after the leaver's character was deleted - the
+// host (skipped above) and the other guest (reloaded at the lamp, "teleported away").
+constexpr u64 InGameStepCreateOffset = 0x01937570; // the in-game step every map load builds
+constexpr u64 DepartureCheckOffset = 0x01316640;   // a member's character is deleted
+constexpr size_t LoadRequestRoleOffset = 0x88;     // the load request's summoned role (byte)
+constexpr size_t PlayerRoleOffset = 0x5D8;         // slot data: the player's role
+constexpr size_t RoleDepartureMarkOffset = 0x15;   // role table: 0 = "this departure sends home"
+constexpr size_t PlayerSlotStride = 0x6A0;
+Bbsc::Role::OwnRoleKeeper bbsc_own_role;
+
+u8 BbscOwnRole() {
+    const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+    const u64 local = ReadablePointer(slots, 0x10) ? ReadValue<u64>(slots, 0x08) : 0;
+    return ReadablePointer(local, PlayerRoleOffset + 4) ? ReadValue<u8>(local, PlayerRoleOffset)
+                                                        : 0xFF;
+}
+
+u8 BbscRoleDepartureMark(u8 role) {
+    if (role >= RoleMetadataCount) {
+        return 0; // the game reads no mark for these, so they count as 0
+    }
+    return ReadValue<u8>(image_base + RoleMetadataTableOffset + role * RoleMetadataStride,
+                         RoleDepartureMarkOffset);
+}
+
+// The table is filled at startup, so it is logged once the first time it has any mark.
+void LogBbscRoleTableOnce() {
+    static bool logged = false;
+    if (logged || image_base == 0) {
+        return;
+    }
+    std::string marks;
+    bool any = false;
+    for (s32 role = 0; role < RoleMetadataCount; ++role) {
+        const u8 mark = BbscRoleDepartureMark(static_cast<u8>(role));
+        any = any || mark != 0;
+        marks += fmt::format("{}{}", role == 0 ? "" : " ", mark);
+    }
+    if (!any) {
+        return;
+    }
+    logged = true;
+    LOG_INFO(Debug, "BBSC role table: departure mark (+0x15) for roles 0..{}: {}",
+             RoleMetadataCount - 1, marks);
+}
+
+void PS4_SYSV_ABI BbscInGameStepHook(u64, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr || image_base == 0) {
+        return;
+    }
+    LogBbscRoleTableOnce();
+    const u64 request = registers->rcx;
+    if (!ReadablePointer(request, LoadRequestRoleOffset + 1)) {
+        LOG_WARNING(Debug, "BBSC role: load step without a readable request ({:#x})", request);
+        return;
+    }
+    const u64 rules = ReadValue<u64>(image_base + SummonSessionRulesPointerOffset, 0);
+    const s32 phase = ReadablePointer(rules, 0x88) ? ReadValue<s32>(rules, 0x84) : -1;
+    const s32 state = GetSessionState();
+    const u32 map = ReadValue<u32>(request, 0x08);
+    const u8 request_role = ReadValue<u8>(request, LoadRequestRoleOffset);
+    const u8 own_before = BbscOwnRole();
+    const u8 role = bbsc_own_role.OnLoadStep(phase, state == 6, request_role);
+    const bool written = role != 0 && WriteValue<u8>(request, LoadRequestRoleOffset, role);
+    LOG_INFO(Debug,
+             "BBSC role: load step into map {:#x} (summon phase {}, session state {}): request "
+             "role {}, own role was {}{}",
+             map, phase, state, request_role, own_before,
+             written       ? fmt::format(" - BBSC reload, request role set to {}", role)
+             : role != 0   ? std::string(" - request role NOT writable")
+                           : std::string());
+    if (written) {
+        BBSC_TIMELINE("SESSION", "role: BBSC reload into {:#x} keeps our summon role {} (the "
+                                 "load would have given us 0, the host's role)",
+                      map, role);
+    }
+}
+
+// Diagnostic only: what the game's departure check is about to decide, from the same values.
+void PS4_SYSV_ABI BbscDepartureCheckHook(u64, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr || image_base == 0) {
+        return;
+    }
+    LogBbscRoleTableOnce();
+    const u64 leaver = registers->rsi;
+    if (!ReadablePointer(leaver, PlayerRoleOffset + 4)) {
+        LOG_INFO(Debug, "BBSC departure check: no leaver data ({:#x})", leaver);
+        return;
+    }
+    const s32 id = ReadValue<s32>(leaver, 0x10);
+    const u8 role = ReadValue<u8>(leaver, PlayerRoleOffset);
+    const u8 mark = BbscRoleDepartureMark(role);
+    const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
+    const u64 records = ReadablePointer(slots, 0xB0) ? ReadValue<u64>(slots, 0x10) : 0;
+    s32 slot = -1;
+    if (ReadablePointer(records, 0x10 + 4 * PlayerSlotStride)) {
+        for (s32 i = 0; i < 4; ++i) {
+            if (ReadValue<s32>(records, 0x10 + i * PlayerSlotStride) == id) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    const bool leaving = slot >= 0 && ReadValue<u8>(slots, 0xA9 + slot * 2) != 0;
+    const bool running = ReadValue<u64>(image_base + 0x0553B0D8, 0) != 0 && BbscEventFlag(4047);
+    const bool home = Bbsc::Role::DepartureSendsHome(running, slot >= 0, leaving, mark);
+    LOG_INFO(Debug,
+             "BBSC departure check: player {:#x} left (slot {}, role {}, role mark {}, leaving "
+             "mark {}, flag 4047 {}, our role {}, session state {}) -> {}",
+             static_cast<u32>(id), slot, role, mark, leaving, running, BbscOwnRole(),
+             GetSessionState(), home ? "the game sends us home in 5 s" : "we stay");
+    BBSC_TIMELINE("LEAVE", "departure check: player {:#x} (slot {}, role {}, mark {}) -> {}",
+                  static_cast<u32>(id), slot, role, mark, home ? "sends us home" : "we stay");
+}
+
+void TickBbscOwnRole() {
+    const u8 kept = bbsc_own_role.Kept();
+    bbsc_own_role.OnTick(GetSessionState() == 6);
+    if (kept != 0 && bbsc_own_role.Kept() == 0) {
+        LOG_INFO(Debug, "BBSC role: the session is over, summon role {} forgotten", kept);
+    }
+    static u8 last = 0xFE;
+    const u8 now = BbscOwnRole();
+    if (now != last) {
+        LOG_INFO(Debug, "BBSC role: our own role {} -> {} (session state {}, kept {})", last, now,
+                 GetSessionState(), bbsc_own_role.Kept());
+        last = now;
+    }
+}
+
 void TickBbscLeaveLocks() {
     static s64 armed_ms = 0;
     const s64 now = SteadyNowMs();
@@ -9666,6 +9800,24 @@ void InstallBbscQuitHook() {
                               std::span<const u8>{Prologue}, 0, BbscSendPhantomHomeHook,
                               &bbsc_send_home_skip)) {
         LOG_ERROR(Debug, "BBSC forced warp: failed to hook {:#x}", SendPhantomHomeOffset);
+    }
+    {
+        static constexpr std::array<u8, 6> R15Prologue{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57};
+        const bool step_ok =
+            InstallGuestCodeHook(reinterpret_cast<void*>(image_base + InGameStepCreateOffset),
+                                 std::span<const u8>{R15Prologue}, 0, BbscInGameStepHook);
+        const bool check_ok =
+            InstallGuestCodeHook(reinterpret_cast<void*>(image_base + DepartureCheckOffset),
+                                 std::span<const u8>{R15Prologue}, 0, BbscDepartureCheckHook);
+        if (!step_ok || !check_ok) {
+            LOG_ERROR(Debug, "BBSC role: failed to hook the load step {:#x} ({}) or the departure "
+                             "check {:#x} ({})",
+                      InGameStepCreateOffset, step_ok, DepartureCheckOffset, check_ok);
+        } else {
+            LOG_INFO(Debug, "BBSC role: a guest keeps its summon role through BBSC's reloads "
+                            "(load step {:#x}, departure check {:#x})",
+                     InGameStepCreateOffset, DepartureCheckOffset);
+        }
     }
     if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + RegistReturnTitleOffset),
                               std::span<const u8>{Prologue}, 0, BbscQuitToTitleHook)) {
@@ -16052,6 +16204,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscGuestDrops();
         TickBbscSendBacklog();
         TickBbscLeaveLocks();
+        TickBbscOwnRole();
         TickBbscStuckLeaveLocks();
         TickBbscStrandedGuest();
         TickBbscBossLine();
