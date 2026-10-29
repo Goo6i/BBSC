@@ -21,6 +21,21 @@ jobs:
       - name: Submodules the mod build uses (fmt, xbyak)
         run: git submodule update --init --depth 1 emulator/externals/fmt emulator/externals/xbyak
 
+      - name: BBSC logic tests (emulator/mod/tests, no game needed)
+        shell: pwsh
+        run: |
+          $tests = @(Get-ChildItem emulator/mod/tests -Filter *_test.cpp -ErrorAction SilentlyContinue)
+          if ($tests.Count -eq 0) { "no tests on this branch"; exit 0 }
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath
+          New-Item -ItemType Directory -Force build/tests | Out-Null
+          foreach ($t in $tests) {
+            $exe = "build\tests\$($t.BaseName).exe"
+            $cmd = "@echo off`r`ncall `"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul || exit /b 1`r`nset `"PATH=$vs\VC\Tools\Llvm\x64\bin;%PATH%`"`r`nclang-cl /nologo /std:c++20 /EHsc /W4 /WX /I emulator\src `"$($t.FullName)`" /Fobuild\tests\ /Fe$exe || exit /b 1`r`n$exe`r`n"
+            Set-Content -Path build/tests/run.cmd -Value $cmd -Encoding ascii
+            cmd /c build\tests\run.cmd
+            if ($LASTEXITCODE -ne 0) { throw "$($t.Name) failed (exit $LASTEXITCODE)" }
+          }
+
       - name: build-mod.cmd with this runner's paths
         shell: pwsh
         run: |
