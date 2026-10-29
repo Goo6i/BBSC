@@ -32,6 +32,7 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "common/logging/log.h"
@@ -41,6 +42,7 @@
 #include "core/bbsc_memscan.h"
 #include "core/bbsc_persistence.h"
 #include "core/bbsc_role.h"
+#include "core/bbsc_chalice.h"
 #include "core/bbsc_cinematic.h"
 #include "imgui/bbsc_loading_layer.h"
 #include "core/cpu_patches.h"
@@ -4499,6 +4501,11 @@ bool BbscWarpJoinEnabled() {
     return enabled;
 }
 
+// Chalice Dungeons together (see "Chalice Dungeons together"): a follow or join reload into the
+// host's Chalice waits until the host's dungeon is in our entry 0.
+bool BbscChaliceFollowAllowed(u32 host_map, s64 now, std::string_view why);
+bool BbscChaliceJoinMayReload(u32 map, s64 now);
+
 // A real reload for a guest in a session, to `to` (map + spot).
 //
 // Uses the game's own forced summon placement, in exactly the order the fork's cross-map join
@@ -4626,6 +4633,9 @@ void TickBbscJoinTeleport() {
     // into "Beckoner" (Eryk, 2026-09-23).
     if (BbscWarpJoinEnabled() && bbsc_cross_map_join.load(std::memory_order_acquire) &&
         !warp_requested) {
+        if (!BbscChaliceJoinMayReload(GetCurrentPackedMap(), now)) {
+            return; // into a Chalice: the reload waits for the host's dungeon (up to 20 s)
+        }
         SummonPlacementDescriptor to{};
         to.packed_region = GetCurrentPackedMap();
         to.x = host_transform->position[0] + 1.0f;
@@ -5052,6 +5062,12 @@ void TickBbscFollowHost() {
     }
     if (attempts >= BbscFollowMaxAttempts) {
         return; // gave up on this map; a new host map starts a fresh count
+    }
+    // Test 2026-10-29: following the host into its Chalice Dungeon, each guest's game built its own
+    // dungeon under the host's coordinates and a guest fell through the floor. Only with the host's
+    // dungeon in our entry 0 (see "Chalice Dungeons together").
+    if (!BbscChaliceFollowAllowed(host.packed_map, now, "follow")) {
+        return;
     }
     // Load the host's world, not our own: its flags for that map first (sent every second).
     static u32 world_wait_map = 0;
@@ -9366,6 +9382,477 @@ void LogBbscRoleTableOnce() {
              RoleMetadataCount - 1, marks);
 }
 
+// ---- Chalice Dungeons together (2026-10-29) -----------------------------------------------------
+// See core/bbsc_chalice.h for the game code, the plan and the tests. Test 2026-10-29 (host + 2
+// guests, glyph 6s46u7i4 layer 3): a guest without that dungeon fell through the floor every time it
+// was placed at the host - each game built its own selected dungeon on its own last layer.
+namespace Chalice = ::Bbsc::Chalice;
+constexpr u64 HolygrailPointerOffset = 0x0553E9E8;     // SprjHolygrail: +8 the dungeon entries
+constexpr u64 ChaliceChannelFetchOffset = 0x01E65290;  // channel cache + POST /channel/get_info
+constexpr u64 ChaliceVisitBuildOffset = 0x01AC3EF0;    // entry 0 from a fetched channel
+constexpr u64 ChaliceSlotSelectOffset = 0x013B89B0;    // slot k: flag 9020+k, its own flag storage
+constexpr u64 ChaliceFlagBankOffset = 0x013BB590;      // flag bank: 0 our own, 1 the session's
+constexpr size_t FlagBankModeOffset = 0x80;            // flag manager: current bank
+constexpr size_t GrailEntriesOffset = 0x08;
+constexpr size_t GrailEntryStateOffset = 0x364;
+constexpr size_t GrailEntryBusyOffset = 0x36C;
+constexpr s32 GrailEntryReady = 5;
+constexpr size_t ChannelObjectRefsOffset = 0x08;       // DLReferenceCountObject
+constexpr size_t ChannelObjectStateOffset = 0x114;     // 1 requesting, 3 ready, 0 / 2 failed
+constexpr s64 BbscChaliceHostFreshMs = 5'000;          // the host sends its dungeon every second
+
+// The four game functions BBSC calls, checked once: the common prologue proves little, so also
+// one instruction only that function has.
+bool BbscChaliceCodeOk() {
+    static const bool ok = [] {
+        static constexpr std::array<u8, 6> Prologue{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57};
+        struct Expect {
+            u64 function;
+            u64 marker;
+            std::array<u8, 6> bytes;
+            size_t size;
+            const char* what;
+        };
+        static constexpr std::array<Expect, 4> Expected{{
+            {ChaliceChannelFetchOffset, 0x01E653BF, {0xE8, 0x3C, 0x1E, 0x00, 0x00}, 5,
+             "channel fetch (call 0x01E67200)"},
+            {ChaliceVisitBuildOffset, 0x01AC401C, {0xE8, 0x5F, 0x12, 0xFE, 0xFF}, 5,
+             "visit build (call 0x01AA5280)"},
+            {ChaliceSlotSelectOffset, 0x013B8AA2, {0x81, 0xC6, 0x3C, 0x23, 0x00, 0x00}, 6,
+             "slot select (add esi, 9020)"},
+            {ChaliceFlagBankOffset, 0x013BC286, {0xB9, 0x43, 0x23, 0x00, 0x00}, 5,
+             "flag bank (mov ecx, 9027)"},
+        }};
+        bool all = true;
+        for (const Expect& e : Expected) {
+            const bool prologue = std::memcmp(reinterpret_cast<const void*>(image_base + e.function),
+                                              Prologue.data(), Prologue.size()) == 0;
+            const bool marker = std::memcmp(reinterpret_cast<const void*>(image_base + e.marker),
+                                            e.bytes.data(), e.size) == 0;
+            if (!prologue || !marker) {
+                LOG_ERROR(Debug, "BBSC chalice: {} at {:#x} does not match this game ({}{}) - "
+                                 "Chalice Dungeons together OFF",
+                          e.what, e.function, prologue ? "" : "prologue ", marker ? "" : "marker");
+                all = false;
+            }
+        }
+        if (all) {
+            LOG_INFO(Debug, "BBSC chalice: game code checked, Chalice Dungeons together ON");
+        }
+        return all;
+    }();
+    return ok;
+}
+
+u64 BbscFlagManager() {
+    const u64 man = ReadValue<u64>(image_base + WorldFlagManPointerOffset, 0);
+    return ReadablePointer(man, FlagBankModeOffset + 4) ? man : 0;
+}
+
+u64 BbscGrailEntry(s32 slot) {
+    const u64 grail = ReadValue<u64>(image_base + HolygrailPointerOffset, 0);
+    if (!ReadablePointer(grail, GrailEntriesOffset + 8)) {
+        return 0;
+    }
+    const u64 entries = ReadValue<u64>(grail, GrailEntriesOffset);
+    if (!ReadablePointer(entries, static_cast<size_t>(slot + 1) * 8)) {
+        return 0;
+    }
+    const u64 entry = ReadValue<u64>(entries, static_cast<size_t>(slot) * 8);
+    return ReadablePointer(entry, Chalice::EntryBytes) ? entry : 0;
+}
+
+// The dungeon slot the flags select now (in the bank in use), -1 none.
+s32 BbscChaliceSelectedSlot() {
+    for (s32 slot = 0; slot < 7; ++slot) {
+        if (BbscEventFlag(Chalice::SlotFlag(slot))) {
+            return slot;
+        }
+    }
+    return -1;
+}
+
+// The game's own checks before any channel request (0x01E65290, 0x01AA5280).
+bool BbscChaliceNetworkReady() {
+    const u64 net = ReadValue<u64>(image_base + SummonManagerRootPointerOffset, 0);
+    return ReadablePointer(net, 0xA58) && ReadValue<u8>(net, 0x08) != 0 &&
+           ReadValue<u8>(net, 0x9F6) == 0 && ReadValue<u8>(net, 0x9F8) == 0 &&
+           ReadValue<u8>(net, 0xA50) == 0;
+}
+
+std::string BbscChaliceText(const Chalice::Descriptor& d) {
+    return fmt::format("dungeon {:#x} (channel {}, altar layer {})", Chalice::DungeonMap(d),
+                       Chalice::Channel(d), Chalice::Layer(d) + 1);
+}
+
+// The host's dungeon as its last packet said (relay thread writes, game thread reads).
+std::mutex bbsc_chalice_host_mutex;
+std::optional<Chalice::HostDungeon> bbsc_chalice_host;
+s64 bbsc_chalice_host_ms = 0;
+
+std::optional<Chalice::Descriptor> BbscChaliceHostDescriptor() {
+    std::scoped_lock lock{bbsc_chalice_host_mutex};
+    if (!bbsc_chalice_host.has_value() || SteadyNowMs() - bbsc_chalice_host_ms > BbscChaliceHostFreshMs) {
+        return std::nullopt;
+    }
+    return bbsc_chalice_host->descriptor;
+}
+
+Chalice::HostKeeper bbsc_chalice_keeper;  // our own dungeon, for our guests
+Chalice::GuestPrep bbsc_chalice_prep;     // the host's dungeon in our entry 0
+u64 bbsc_chalice_fetch = 0;               // the channel object we hold a reference to
+
+// Self-test on one PC: SHADPS4_BBSC_CHALICE_SELFTEST=<channel>:<layer> builds that dungeon (through
+// entry 0, like a guest) on a solo Chalice load, and puts our own slot back on the next load out.
+const std::optional<Chalice::SelfTest>& BbscChaliceSelfTest() {
+    static const std::optional<Chalice::SelfTest> test = [] {
+        const char* text = std::getenv("SHADPS4_BBSC_CHALICE_SELFTEST");
+        if (text == nullptr || *text == '\0') {
+            return std::optional<Chalice::SelfTest>{};
+        }
+        const auto parsed = Chalice::ParseSelfTest(text);
+        if (parsed.has_value()) {
+            LOG_WARNING(Debug, "BBSC chalice self-test ON: solo Chalice loads build channel {} on "
+                               "layer {} through entry 0",
+                        parsed->channel, parsed->layer + 1);
+        } else {
+            LOG_ERROR(Debug, "BBSC chalice self-test: \"{}\" is not <channel>:<layer 1-4>, OFF", text);
+        }
+        return parsed;
+    }();
+    return test;
+}
+bool bbsc_chalice_selftest_applied = false;
+s32 bbsc_chalice_selftest_own_slot = -1;
+
+Chalice::FetchState BbscChaliceFetchState() {
+    if (bbsc_chalice_fetch == 0) {
+        return Chalice::FetchState::None;
+    }
+    switch (ReadValue<s32>(bbsc_chalice_fetch, ChannelObjectStateOffset)) {
+    case 1:
+        return Chalice::FetchState::Requesting;
+    case 3:
+        return Chalice::FetchState::Ready;
+    default:
+        return Chalice::FetchState::Failed;
+    }
+}
+
+void BbscChaliceStartFetch(u64 channel) {
+    using Fetch = u64* PS4_SYSV_ABI (*)(u64* out, const u64* channel_id);
+    u64 object = 0;
+    const u64 id = channel;
+    reinterpret_cast<Fetch>(image_base + ChaliceChannelFetchOffset)(&object, &id);
+    bbsc_chalice_fetch = ReadablePointer(object, ChannelObjectStateOffset + 4) ? object : 0;
+    LOG_INFO(Debug, "BBSC chalice: asked the server for channel {} ({})", channel,
+             bbsc_chalice_fetch != 0 ? "request sent" : "the game sent no request");
+}
+
+// The game's own release (DLReferenceCountObject::Unref): the cache keeps its reference.
+void BbscChaliceReleaseFetch() {
+    const u64 object = std::exchange(bbsc_chalice_fetch, 0);
+    if (object == 0 || !HasMemoryAccess(object + ChannelObjectRefsOffset, 4, MemoryProt::CpuWrite)) {
+        return;
+    }
+    const s32 before =
+        std::atomic_ref<s32>(*reinterpret_cast<s32*>(object + ChannelObjectRefsOffset)).fetch_sub(1);
+    if (before == 1) {
+        using Destroy = void PS4_SYSV_ABI (*)(u64 self);
+        const u64 vtable = ReadValue<u64>(object, 0);
+        const u64 destroy = ReadablePointer(vtable, 8) ? ReadValue<u64>(vtable, 0) : 0;
+        if (IsEbootCodeAddress(destroy)) {
+            reinterpret_cast<Destroy>(destroy)(object);
+        }
+    }
+}
+
+bool BbscChaliceBuildEntry0(u64 channel) {
+    using Build = u64 PS4_SYSV_ABI (*)(u64 holygrail, const u64* channel_id);
+    const u64 grail = ReadValue<u64>(image_base + HolygrailPointerOffset, 0);
+    if (!ReadablePointer(grail, GrailEntriesOffset + 8)) {
+        return false;
+    }
+    const u64 id = channel;
+    return (reinterpret_cast<Build>(image_base + ChaliceVisitBuildOffset)(grail, &id) & 0xFF) != 0;
+}
+
+void BbscChaliceSelectSlot(u64 flag_manager, s32 slot) {
+    using Select = void PS4_SYSV_ABI (*)(u64 manager, s32 slot);
+    reinterpret_cast<Select>(image_base + ChaliceSlotSelectOffset)(flag_manager, slot);
+}
+
+void BbscChaliceFlagBank(u64 flag_manager, s32 mode) {
+    using Bank = void PS4_SYSV_ABI (*)(u64 manager, s32 mode);
+    reinterpret_cast<Bank>(image_base + ChaliceFlagBankOffset)(flag_manager, mode);
+}
+
+const char* BbscChaliceStatusName(Chalice::Status status) {
+    switch (status) {
+    case Chalice::Status::Idle:
+        return "idle";
+    case Chalice::Status::Working:
+        return "preparing";
+    case Chalice::Status::Ready:
+        return "ready";
+    case Chalice::Status::Failed:
+        return "failed";
+    }
+    return "?";
+}
+
+// Every 250 ms on the game thread: a host tells its guests its dungeon; a guest (or the self-test)
+// gets the host's dungeon into entry 0.
+void TickBbscChalice() {
+    static s64 last_ms = 0;
+    static s64 last_send_ms = 0;
+    static u32 told_sequence = 0;
+    static Chalice::Status logged_status = Chalice::Status::Idle;
+    const s64 now = SteadyNowMs();
+    if (image_base == 0 || now - last_ms < 250) {
+        return;
+    }
+    last_ms = now;
+    if (!BbscChaliceCodeOk()) {
+        return;
+    }
+    const s32 state = GetSessionState();
+    const u32 here = GetCurrentPackedMap();
+
+    if (now - last_send_ms >= 1'000) {
+        if (const auto mine = bbsc_chalice_keeper.ToSend(state == 3, here)) {
+            last_send_ms = now;
+            const auto frame = Chalice::EncodePacket(mine->sequence, mine->descriptor);
+            const u32 peers = Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(
+                frame.data(), static_cast<u32>(frame.size()));
+            if (told_sequence != mine->sequence) {
+                told_sequence = mine->sequence;
+                LOG_INFO(Debug, "BBSC chalice: hosting in {}, telling {} peer(s)",
+                         BbscChaliceText(mine->descriptor), peers);
+                BBSC_TIMELINE("CHALICE", "chalice: hosting in {}", BbscChaliceText(mine->descriptor));
+            }
+        }
+    }
+
+    const bool guest = state == 4 || state == 6;
+    const auto& self_test = BbscChaliceSelfTest();
+    Chalice::PrepInput in{};
+    in.now_ms = now;
+    if (guest) {
+        in.host = BbscChaliceHostDescriptor();
+    } else if (state == 0 && self_test.has_value()) {
+        in.host = Chalice::SelfTestTarget(*self_test);
+    }
+    const u64 entry0 = BbscGrailEntry(0);
+    in.entry0_channel = entry0 != 0 ? ReadValue<u64>(entry0, Chalice::EntryChannel) : 0;
+    in.entry0_ready = entry0 != 0 && ReadValue<s32>(entry0, GrailEntryStateOffset) == GrailEntryReady &&
+                      ReadValue<s32>(entry0, GrailEntryBusyOffset) == 0;
+    in.fetch = BbscChaliceFetchState();
+    in.network_ready = BbscChaliceNetworkReady();
+    static bool logged_network = true;
+    if (in.host.has_value() && in.network_ready != logged_network) {
+        logged_network = in.network_ready;
+        LOG_INFO(Debug, "BBSC chalice: the game's network checks for a channel request now {}",
+                 in.network_ready ? "pass" : "FAIL (offline, or a network error is up)");
+    }
+    // Entry 0 is the dungeon we stand in while slot 0 is selected in the Chalice: never rebuild it.
+    in.can_build = !(Chalice::IsChaliceMap(here) && BbscChaliceSelectedSlot() == 0);
+    const auto action = bbsc_chalice_prep.Tick(in);
+    switch (action) {
+    case Chalice::Action::None:
+        break;
+    case Chalice::Action::StartFetch:
+        BbscChaliceStartFetch(bbsc_chalice_prep.target());
+        break;
+    case Chalice::Action::ReleaseFetch:
+        BbscChaliceReleaseFetch();
+        break;
+    case Chalice::Action::BuildEntry: {
+        const bool built = BbscChaliceBuildEntry0(bbsc_chalice_prep.target());
+        LOG_INFO(Debug, "BBSC chalice: building channel {} into entry 0: {} (entry state {})",
+                 bbsc_chalice_prep.target(), built ? "done" : "not done",
+                 entry0 != 0 ? ReadValue<s32>(entry0, GrailEntryStateOffset) : -1);
+        break;
+    }
+    }
+    const auto status = bbsc_chalice_prep.status();
+    if (status != logged_status) {
+        logged_status = status;
+        const char* reason = bbsc_chalice_prep.reason();
+        LOG_INFO(Debug, "BBSC chalice: host's dungeon (channel {}) {}{}{} - session state {}, map {:#x}",
+                 bbsc_chalice_prep.target(), BbscChaliceStatusName(status), *reason ? ": " : "",
+                 reason, state, here);
+        if (status == Chalice::Status::Ready || status == Chalice::Status::Failed) {
+            BBSC_TIMELINE("CHALICE", "chalice: host's dungeon (channel {}) {}{}{}",
+                          bbsc_chalice_prep.target(), BbscChaliceStatusName(status),
+                          *reason ? ": " : "", reason);
+        }
+    }
+}
+
+// The follow (TickBbscFollowHost) asks before loading into the host's map: into a Chalice only
+// with the host's dungeon in entry 0. Refused = no load, and the guest is told once.
+bool BbscChaliceFollowAllowed(u32 host_map, s64 now, std::string_view why) {
+    static s64 wait_since = 0;
+    static s64 last_ask = 0;
+    static u64 told_for = ~0ull;
+    if (!Chalice::IsChaliceMap(host_map)) {
+        wait_since = 0;
+        return true;
+    }
+    if (wait_since == 0 || now - last_ask > 2'000) {
+        wait_since = now; // a fresh wait (the last ask was for an earlier attempt)
+    }
+    last_ask = now;
+    const auto status = BbscChaliceCodeOk() ? bbsc_chalice_prep.status() : Chalice::Status::Failed;
+    switch (Chalice::FollowGate(host_map, status, now - wait_since)) {
+    case Chalice::Gate::Go:
+        told_for = ~0ull;
+        return true;
+    case Chalice::Gate::Wait:
+        return false;
+    case Chalice::Gate::Refuse:
+        break;
+    }
+    if (told_for != bbsc_chalice_prep.target()) {
+        told_for = bbsc_chalice_prep.target();
+        const char* reason = BbscChaliceCodeOk() ? bbsc_chalice_prep.reason() : "game code mismatch";
+        LOG_WARNING(Debug, "BBSC chalice: not loading into the host's Chalice Dungeon ({}; channel {}, "
+                           "{}: {}) - we would build a different dungeon and fall",
+                    why, bbsc_chalice_prep.target(), BbscChaliceStatusName(status),
+                    *reason ? reason : "not ready in time");
+        BBSC_TIMELINE("CHALICE", "chalice: not loading into the host's dungeon ({}: {})",
+                      BbscChaliceStatusName(status), *reason ? reason : "not ready in time");
+        BbscAnnounce(u"The host's Chalice Dungeon could not be loaded here.\n"
+                     u"Wait for the host outside the dungeon.",
+                     "chalice refused");
+    }
+    return false;
+}
+
+// The join's second reload (cross-map join) after a summon into the host's Chalice: waits for the
+// host's dungeon like a follow does, but a refused one still reloads - the summon load has already
+// put us in a Chalice, and the reload is the join's own fix for the summon load.
+bool BbscChaliceJoinMayReload(u32 map, s64 now) {
+    static s64 wait_since = 0;
+    static s64 last_ask = 0;
+    if (!Chalice::IsChaliceMap(map)) {
+        wait_since = 0;
+        return true;
+    }
+    if (wait_since == 0 || now - last_ask > 2'000) {
+        wait_since = now;
+    }
+    last_ask = now;
+    const auto status = BbscChaliceCodeOk() ? bbsc_chalice_prep.status() : Chalice::Status::Failed;
+    const auto gate = Chalice::FollowGate(map, status, now - wait_since);
+    if (gate == Chalice::Gate::Wait) {
+        return false;
+    }
+    if (gate == Chalice::Gate::Refuse) {
+        const char* reason = bbsc_chalice_prep.reason();
+        LOG_WARNING(Debug, "BBSC chalice: join reload without the host's dungeon (channel {} {}{}{})",
+                    bbsc_chalice_prep.target(), BbscChaliceStatusName(status), *reason ? ": " : "",
+                    reason);
+    }
+    wait_since = 0;
+    return true;
+}
+
+// Every load step (BbscInGameStepHook), before the game reads the slot flags or the descriptor.
+void BbscChaliceOnLoadStep(u64 request, u32 map, s32 phase, s32 state) {
+    if (!BbscChaliceCodeOk() ||
+        !ReadablePointer(request, Chalice::RequestDescriptorOffset + Chalice::DescriptorSize)) {
+        return;
+    }
+    const auto in_request =
+        ReadValue<Chalice::Descriptor>(request, Chalice::RequestDescriptorOffset);
+    const bool as_guest = phase == Chalice::SummonPhase && state != 3;
+    bbsc_chalice_keeper.OnLoad(map, as_guest, in_request);
+    const u64 flags = BbscFlagManager();
+    const u64 entry0 = BbscGrailEntry(0);
+    const auto entry0_bytes = entry0 != 0 ? ReadValue<std::array<u8, Chalice::EntryBytes>>(entry0, 0)
+                                          : std::array<u8, Chalice::EntryBytes>{};
+
+    // Self-test (solo): our own slot back on the next load out of the Chalice.
+    const auto& self_test = BbscChaliceSelfTest();
+    if (self_test.has_value() && flags != 0) {
+        const auto step = Chalice::PlanSelfTestLoad(map, state, bbsc_chalice_prep.status(),
+                                                    bbsc_chalice_selftest_applied);
+        if (step == Chalice::SelfTestStep::Restore) {
+            const s32 own = bbsc_chalice_selftest_own_slot;
+            if (own >= 0 && own < 7) {
+                BbscChaliceSelectSlot(flags, own);
+            }
+            LOG_INFO(Debug, "BBSC chalice self-test: load into {:#x}, our own slot {} {} (flags now "
+                            "select {})",
+                     map, own, own >= 0 && own < 7 ? "is back" : "UNKNOWN, left as is",
+                     BbscChaliceSelectedSlot());
+            bbsc_chalice_selftest_applied = false;
+            bbsc_chalice_selftest_own_slot = -1;
+        } else if (step == Chalice::SelfTestStep::Apply) {
+            if (!bbsc_chalice_selftest_applied) {
+                bbsc_chalice_selftest_own_slot = BbscChaliceSelectedSlot();
+            }
+            BbscChaliceSelectSlot(flags, 0);
+            const auto built = Chalice::FromEntry(entry0_bytes.data(), in_request, self_test->layer);
+            const bool written = WriteValue(request, Chalice::RequestDescriptorOffset, built);
+            bbsc_chalice_selftest_applied = true;
+            LOG_INFO(Debug, "BBSC chalice self-test: solo load builds {} from entry 0 instead of the "
+                            "altar's {} (slot {} -> {}, request {})",
+                     BbscChaliceText(built), BbscChaliceText(in_request),
+                     bbsc_chalice_selftest_own_slot, BbscChaliceSelectedSlot(),
+                     written ? "written" : "NOT writable");
+            BBSC_TIMELINE("CHALICE", "chalice self-test: building {} (altar picked {})",
+                          BbscChaliceText(built), BbscChaliceText(in_request));
+            return;
+        }
+    }
+    if (!Chalice::IsChaliceMap(map) || !as_guest) {
+        return;
+    }
+    const s32 bank = flags != 0 ? ReadValue<s32>(flags, FlagBankModeOffset) : -1;
+    const auto plan = Chalice::PlanGuestLoad(map, phase, as_guest, bank, bbsc_chalice_prep.status());
+    const auto host = BbscChaliceHostDescriptor();
+    if (!plan.apply || !host.has_value() || flags == 0 ||
+        Chalice::Channel(*host) != bbsc_chalice_prep.target()) {
+        const char* reason = bbsc_chalice_prep.reason();
+        LOG_WARNING(Debug, "BBSC chalice: guest load into the Chalice WITHOUT the host's dungeon "
+                           "(channel {} {}{}{}; host packet {}) - the game builds our own {}",
+                    bbsc_chalice_prep.target(), BbscChaliceStatusName(bbsc_chalice_prep.status()),
+                    *reason ? ": " : "", reason, host.has_value() ? "fresh" : "none",
+                    BbscChaliceText(in_request));
+        BBSC_TIMELINE("CHALICE", "chalice: guest load WITHOUT the host's dungeon ({})",
+                      BbscChaliceStatusName(bbsc_chalice_prep.status()));
+        return;
+    }
+    const s32 slot_before = BbscChaliceSelectedSlot();
+    if (plan.enter_session_bank) {
+        BbscChaliceFlagBank(flags, Chalice::SessionBank); // what the step itself does next
+    }
+    BbscChaliceSelectSlot(flags, 0);
+    const bool written = WriteValue(request, Chalice::RequestDescriptorOffset, *host);
+    // A check of the reading behind all this: entry 0 + the host's layer should give exactly the
+    // descriptor the host's own altar wrote.
+    const auto from_entry = Chalice::FromEntry(entry0_bytes.data(), in_request, Chalice::Layer(*host));
+    size_t first_difference = Chalice::DescriptorSize;
+    for (size_t i = 0; i < Chalice::DescriptorSize; ++i) {
+        if (from_entry[i] != (*host)[i]) {
+            first_difference = i;
+            break;
+        }
+    }
+    LOG_INFO(Debug, "BBSC chalice: guest load builds the host's {} from entry 0 (flag bank {} -> {}, "
+                    "slot {} -> {}, request {}; entry 0 {} the host's descriptor{})",
+             BbscChaliceText(*host), bank, ReadValue<s32>(flags, FlagBankModeOffset), slot_before,
+             BbscChaliceSelectedSlot(), written ? "written" : "NOT writable",
+             first_difference == Chalice::DescriptorSize ? "matches" : "differs from",
+             first_difference == Chalice::DescriptorSize
+                 ? std::string()
+                 : fmt::format(" at +{:#x}", first_difference));
+    BBSC_TIMELINE("CHALICE", "chalice: guest load builds the host's {}", BbscChaliceText(*host));
+}
+
 void PS4_SYSV_ABI BbscInGameStepHook(u64, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr || image_base == 0) {
         return;
@@ -9382,6 +9869,7 @@ void PS4_SYSV_ABI BbscInGameStepHook(u64, const GuestRegisterSnapshot* registers
     const u32 map = ReadValue<u32>(request, 0x08);
     const u8 request_role = ReadValue<u8>(request, LoadRequestRoleOffset);
     const u8 own_before = BbscOwnRole();
+    BbscChaliceOnLoadStep(request, map, phase, state);
     const u8 role = bbsc_own_role.OnLoadStep(phase, state == 6, request_role);
     static const bool keep_role = EnvFlagEnabled("SHADPS4_BBSC_KEEP_ROLE");
     const u8 to_write = ::Bbsc::Role::RoleToWrite(keep_role, role);
@@ -16214,6 +16702,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscSendBacklog();
         TickBbscLeaveLocks();
         TickBbscOwnRole();
+        TickBbscChalice();
         TickBbscStuckLeaveLocks();
         TickBbscStrandedGuest();
         TickBbscBossLine();
@@ -16910,6 +17399,16 @@ bool BbscConnectFirstPlacementFresh() {
 void OnBbscHostBossPacket(std::int32_t boss) {
     bbsc_host_boss_id = boss;
     bbsc_host_boss_ms = SteadyNowMs();
+}
+
+void OnBbscHostDungeonPacket(const std::uint8_t* frame, std::size_t size) {
+    const auto decoded = ::Bbsc::Chalice::DecodePacket(frame, size);
+    if (!decoded.has_value()) {
+        return;
+    }
+    std::scoped_lock lock{bbsc_chalice_host_mutex};
+    bbsc_chalice_host = decoded;
+    bbsc_chalice_host_ms = SteadyNowMs();
 }
 
 void OnBbscProgressPacket(const std::uint32_t* flags, std::size_t count) {
