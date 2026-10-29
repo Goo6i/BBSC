@@ -9853,6 +9853,109 @@ void BbscChaliceOnLoadStep(u64 request, u32 map, s32 phase, s32 state) {
     BBSC_TIMELINE("CHALICE", "chalice: guest load builds the host's {}", BbscChaliceText(*host));
 }
 
+// ---- Chalice probe (diagnostic, not for upstream) -----------------------------------------------
+// Which dungeon a Chalice load builds: the in-game step reads event flags 9020..9026 as 7 bits
+// and picks entry [[SprjHolygrail 0x0553E9E8]+8][k] for flag 9020+k. One block per Chalice load,
+// into logs\bbsc-chalice-probe-<date>-<time>-<pid>.txt, to diff loads of different dungeons and
+// layers.
+
+void AppendBbscHex(std::string& out, u64 base, size_t size) {
+    for (size_t row = 0; row < size; row += 32) {
+        out += fmt::format("  +{:03x}:", row);
+        for (size_t i = row; i < row + 32 && i < size; ++i) {
+            out += fmt::format("{}{:02x}", (i % 8) == 0 ? "  " : " ", ReadValue<u8>(base, i));
+        }
+        out += '\n';
+    }
+}
+
+size_t BbscReadableSize(u64 base, size_t want) {
+    for (size_t size = want; size >= 0x40; size /= 2) {
+        if (ReadablePointer(base, size)) {
+            return size;
+        }
+    }
+    return 0;
+}
+
+void BbscChaliceProbe(u64 request, u32 map, s32 phase, s32 state, u8 request_role) {
+    if ((map & 0xFF000000U) != 0x1D000000U) {
+        return;
+    }
+    static std::ofstream file;
+    static bool opened = false;
+    if (!opened) {
+        opened = true;
+        namespace fs = std::filesystem;
+        const std::time_t now_c = std::time(nullptr);
+        std::tm local{};
+#ifdef _WIN32
+        localtime_s(&local, &now_c);
+#else
+        localtime_r(&now_c, &local);
+#endif
+#ifdef BBSC_MOD
+        const fs::path dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "logs";
+#else
+        const fs::path dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+#endif
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        const fs::path path =
+            dir / fmt::format("bbsc-chalice-probe-{:04}{:02}{:02}-{:02}{:02}{:02}-{}.txt",
+                              local.tm_year + 1900, local.tm_mon + 1, local.tm_mday, local.tm_hour,
+                              local.tm_min, local.tm_sec, static_cast<long>(BbscTimelinePid()));
+        file.open(path, std::ios::out | std::ios::app);
+        LOG_INFO(Debug, "BBSC chalice probe: writing {}", path.string());
+    }
+    if (!file) {
+        return;
+    }
+    std::string out;
+    const std::time_t now_c = std::time(nullptr);
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &now_c);
+#else
+    localtime_r(&now_c, &local);
+#endif
+    u32 flags = 0;
+    for (u32 bit = 0; bit < 7; ++bit) {
+        flags |= (BbscEventFlag(9020 + bit) ? 1U : 0U) << bit;
+    }
+    // Flag 9020+k selects entry k (bit k here: this reads them first-first, the game last-first).
+    const s32 index = flags != 0 ? std::countr_zero(flags) : -1;
+    const u64 grail = ReadValue<u64>(image_base + HolygrailPointerOffset, 0);
+    const u64 entries = ReadablePointer(grail, 0x10) ? ReadValue<u64>(grail, 0x08) : 0;
+    const u64 flag_manager = BbscFlagManager();
+    const u64 entry0 = BbscGrailEntry(0);
+    out += fmt::format("== {:02}:{:02}:{:02} load into {:#010x} (summon phase {}, session state {}, "
+                       "request role {}, our role {}): flags 9020..9026 = {:#04x} -> entry {}; flag "
+                       "bank {}; entry 0 state {} channel {}\n",
+                       local.tm_hour, local.tm_min, local.tm_sec, map, phase, state, request_role,
+                       BbscOwnRole(), flags, index,
+                       flag_manager != 0 ? ReadValue<s32>(flag_manager, FlagBankModeOffset) : -1,
+                       entry0 != 0 ? ReadValue<s32>(entry0, GrailEntryStateOffset) : -1,
+                       entry0 != 0 ? ReadValue<u64>(entry0, Chalice::EntryChannel) : 0);
+    out += fmt::format("holygrail {:#x}\n", grail);
+    if (const size_t n = BbscReadableSize(grail, 0x80)) {
+        AppendBbscHex(out, grail, n);
+    }
+    out += fmt::format("request {:#x}\n", request);
+    if (const size_t n = BbscReadableSize(request, 0x100)) {
+        AppendBbscHex(out, request, n);
+    }
+    for (u32 i = 0; i < 8 && ReadablePointer(entries, 0x40); ++i) {
+        const u64 entry = ReadValue<u64>(entries, i * 8);
+        out += fmt::format("entry {} {:#x}{}\n", i, entry,
+                           static_cast<s32>(i) == index ? "  <- this load" : "");
+        if (const size_t n = BbscReadableSize(entry, 0x400)) {
+            AppendBbscHex(out, entry, n);
+        }
+    }
+    file << out << std::flush;
+}
+
 void PS4_SYSV_ABI BbscInGameStepHook(u64, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr || image_base == 0) {
         return;
@@ -9869,6 +9972,7 @@ void PS4_SYSV_ABI BbscInGameStepHook(u64, const GuestRegisterSnapshot* registers
     const u32 map = ReadValue<u32>(request, 0x08);
     const u8 request_role = ReadValue<u8>(request, LoadRequestRoleOffset);
     const u8 own_before = BbscOwnRole();
+    BbscChaliceProbe(request, map, phase, state, request_role); // before anything is changed
     BbscChaliceOnLoadStep(request, map, phase, state);
     const u8 role = bbsc_own_role.OnLoadStep(phase, state == 6, request_role);
     const bool written = role != 0 && WriteValue<u8>(request, LoadRequestRoleOffset, role);
