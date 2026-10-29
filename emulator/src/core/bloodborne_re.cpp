@@ -9328,7 +9328,7 @@ constexpr size_t LoadRequestRoleOffset = 0x88;     // the load request's summone
 constexpr size_t PlayerRoleOffset = 0x5D8;         // slot data: the player's role
 constexpr size_t RoleDepartureMarkOffset = 0x15;   // role table: 0 = "this departure sends home"
 constexpr size_t PlayerSlotStride = 0x6A0;
-Bbsc::Role::OwnRoleKeeper bbsc_own_role;
+::Bbsc::Role::OwnRoleKeeper bbsc_own_role;
 
 u8 BbscOwnRole() {
     const u64 slots = ReadValue<u64>(image_base + PlayerSlotManagerPointerOffset, 0);
@@ -9425,7 +9425,7 @@ void PS4_SYSV_ABI BbscDepartureCheckHook(u64, const GuestRegisterSnapshot* regis
     }
     const bool leaving = slot >= 0 && ReadValue<u8>(slots, 0xA9 + slot * 2) != 0;
     const bool running = ReadValue<u64>(image_base + 0x0553B0D8, 0) != 0 && BbscEventFlag(4047);
-    const bool home = Bbsc::Role::DepartureSendsHome(running, slot >= 0, leaving, mark);
+    const bool home = ::Bbsc::Role::DepartureSendsHome(running, slot >= 0, leaving, mark);
     LOG_INFO(Debug,
              "BBSC departure check: player {:#x} left (slot {}, role {}, role mark {}, leaving "
              "mark {}, flag 4047 {}, our role {}, session state {}) -> {}",
