@@ -39,6 +39,7 @@
     {"id": "shared_progress", "name": "Shared progress", "description": "When a guest goes home, bosses, shortcuts, doors and lamps the host has done are added to the guest's own world (adds only, never removes; NPC quests and your character are not touched; saves backed up first)", "type": "bool", "default": true, "env": "SHADPS4_BBSC_SHARED_PROGRESS"},
     {"id": "discord", "name": "Discord status", "description": "Shows BBSC, your area, your build, boss fights with a timer, when you are dead or spectating, and the number of hunters on your Discord profile", "type": "bool", "default": true, "env": "SHADPS4_BBSC_DISCORD"},
     {"id": "p2p_channel", "name": "P2P channel", "description": "Sends BBSC's own messages (follow, world sync, scaling, leaving) straight to the other players over the game's own connection when there is no BBSC relay - needed on public servers (The Hunter's Dream)", "type": "bool", "default": true, "env": "SHADPS4_BBSC_P2P_CHANNEL"},
+    {"id": "split_datagrams", "name": "Small network packets", "description": "Sends the game's own network packets in pieces of at most 1100 bytes. Some mobile and 5G lines lose the bigger ones the game makes, which stalls co-op and drops the host's frame rate until a guest leaves. Leave on", "type": "bool", "default": true, "env": "SHADPS4_BBSC_SPLIT_DATAGRAMS"},
     {"id": "relay", "name": "Relay address", "description": "host:20444 - leave empty to use the game server address from host_overrides.json (JOIN-HOST sets it)", "type": "text", "default": "", "env": "BBSC_RELAY"}
   ]
 }
