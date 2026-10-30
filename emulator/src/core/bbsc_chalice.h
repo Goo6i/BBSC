@@ -307,6 +307,13 @@ inline Gate FollowGate(std::uint32_t host_map, Status status, std::int64_t waite
     return Gate::Wait;
 }
 
+// Switch SHADPS4_BBSC_CHALICE_TOGETHER (on by default). Off is BBSC 0.0.2: no fetch, no build, no
+// slot change, and a follow or join into a Chalice goes ahead at once (into our own dungeon).
+inline Gate SwitchedFollowGate(bool together_switch, std::uint32_t host_map, Status status,
+                               std::int64_t waited_ms) {
+    return together_switch ? FollowGate(host_map, status, waited_ms) : Gate::Go;
+}
+
 // ---- Guest: the load step of a summon-phase load into the host's Chalice ----
 constexpr int SummonPhase = 3;
 constexpr int SessionBank = 1;

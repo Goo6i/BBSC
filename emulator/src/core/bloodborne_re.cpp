@@ -9444,6 +9444,20 @@ bool BbscChaliceCodeOk() {
     return ok;
 }
 
+// Switch SHADPS4_BBSC_CHALICE_TOGETHER (Mods tab, on): off = BBSC 0.0.2 (no fetch, no build, no slot
+// change, follows and joins into a Chalice go ahead into our own dungeon).
+bool BbscChaliceSwitchOn() {
+    static const bool on = [] {
+        const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_CHALICE_TOGETHER");
+        if (!enabled) {
+            LOG_INFO(Debug, "BBSC chalice: Chalice Dungeons together OFF (SHADPS4_BBSC_CHALICE_TOGETHER=0)"
+                            " - a follow into a Chalice loads our own dungeon, as in 0.0.2");
+        }
+        return enabled;
+    }();
+    return on;
+}
+
 u64 BbscFlagManager() {
     const u64 man = ReadValue<u64>(image_base + WorldFlagManPointerOffset, 0);
     return ReadablePointer(man, FlagBankModeOffset + 4) ? man : 0;
@@ -9613,7 +9627,7 @@ void TickBbscChalice() {
         return;
     }
     last_ms = now;
-    if (!BbscChaliceCodeOk()) {
+    if (!BbscChaliceSwitchOn() || !BbscChaliceCodeOk()) {
         return;
     }
     const s32 state = GetSessionState();
@@ -9705,7 +9719,7 @@ bool BbscChaliceFollowAllowed(u32 host_map, s64 now, std::string_view why) {
     }
     last_ask = now;
     const auto status = BbscChaliceCodeOk() ? bbsc_chalice_prep.status() : Chalice::Status::Failed;
-    switch (Chalice::FollowGate(host_map, status, now - wait_since)) {
+    switch (Chalice::SwitchedFollowGate(BbscChaliceSwitchOn(), host_map, status, now - wait_since)) {
     case Chalice::Gate::Go:
         told_for = ~0ull;
         return true;
@@ -9745,7 +9759,7 @@ bool BbscChaliceJoinMayReload(u32 map, s64 now) {
     }
     last_ask = now;
     const auto status = BbscChaliceCodeOk() ? bbsc_chalice_prep.status() : Chalice::Status::Failed;
-    const auto gate = Chalice::FollowGate(map, status, now - wait_since);
+    const auto gate = Chalice::SwitchedFollowGate(BbscChaliceSwitchOn(), map, status, now - wait_since);
     if (gate == Chalice::Gate::Wait) {
         return false;
     }
@@ -9761,7 +9775,7 @@ bool BbscChaliceJoinMayReload(u32 map, s64 now) {
 
 // Every load step (BbscInGameStepHook), before the game reads the slot flags or the descriptor.
 void BbscChaliceOnLoadStep(u64 request, u32 map, s32 phase, s32 state) {
-    if (!BbscChaliceCodeOk() ||
+    if (!BbscChaliceSwitchOn() || !BbscChaliceCodeOk() ||
         !ReadablePointer(request, Chalice::RequestDescriptorOffset + Chalice::DescriptorSize)) {
         return;
     }

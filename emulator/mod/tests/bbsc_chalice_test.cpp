@@ -322,6 +322,24 @@ void FollowGate() {
     Check(C::FollowGate(ChaliceMap, Status::Failed, 0) == Gate::Refuse, "failed: do not follow");
 }
 
+// SHADPS4_BBSC_CHALICE_TOGETHER=0: every follow goes ahead as in 0.0.2, whatever the preparation
+// says; on, the gate above decides.
+void SwitchOff() {
+    using C::Gate;
+    Check(C::SwitchedFollowGate(false, ChaliceMap, Status::Failed, 0) == Gate::Go,
+          "switch off: a failed preparation does not stop the follow");
+    Check(C::SwitchedFollowGate(false, ChaliceMap, Status::Idle, 0) == Gate::Go,
+          "switch off: no waiting for the host's dungeon");
+    Check(C::SwitchedFollowGate(false, DreamMap, Status::Idle, 0) == Gate::Go,
+          "switch off: outside the Chalice as before");
+    Check(C::SwitchedFollowGate(true, ChaliceMap, Status::Working, 1000) == Gate::Wait,
+          "switch on: being prepared, wait");
+    Check(C::SwitchedFollowGate(true, ChaliceMap, Status::Failed, 0) == Gate::Refuse,
+          "switch on: failed, do not follow");
+    Check(C::SwitchedFollowGate(true, ChaliceMap, Status::Ready, 0) == Gate::Go,
+          "switch on: ready, follow");
+}
+
 void GuestLoad() {
     auto plan = C::PlanGuestLoad(ChaliceMap, 3, true, 0, Status::Ready);
     Check(plan.apply && plan.enter_session_bank,
@@ -379,6 +397,7 @@ int main() {
     GuestPrepRetries();
     GuestPrepHostMoves();
     FollowGate();
+    SwitchOff();
     GuestLoad();
     SelfTest();
     std::printf("%s\n", failures == 0 ? "all passed" : "FAILED");
