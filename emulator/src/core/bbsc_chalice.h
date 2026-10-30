@@ -10,12 +10,15 @@
 // builds (0x01937570) reads event flags 9020..9026 and picks entry k for flag 9020+k (its reader
 // 0x013CFD80 returns the flags last-first, hence 7 - bit length). The load request it is given
 // (rcx) carries a dungeon descriptor at +0xA0: channel id, dungeon map id, the nine feature pairs,
-// a per-chalice value, the layer (0-based) - written by the altar when the player enters. The step
-// copies only +0x0C..+0x9E of the request, so the descriptor is read later in the load.
+// a per-chalice value, the altar's layer choice (0-based) - written by the altar when the player
+// enters. The step copies only +0x0C..+0x9E of the request, so the descriptor is read later in the
+// load. A dungeon is one map holding all its layers: where the player appears is the start lamp at
+// request +0x80 (Chalice lamps 2902950 + chair, ReturnPointParam warpChairNo 0-9; chair 0 = the
+// entrance), not the layer field.
 //
 // The bug: BBSC's follow, join and wipe reloads only say "map 0x1D000000". Each guest's game then
-// built ITS OWN selected dungeon on ITS OWN last layer under the host's coordinates, and a guest
-// without the host's dungeon fell through the floor (2026-10-29, glyph 6s46u7i4 layer 3).
+// built ITS OWN selected dungeon under the host's coordinates, and a guest without the host's
+// dungeon fell through the floor (2026-10-29, glyph 6s46u7i4 layer 3).
 //
 // The fix copies vanilla's own way into a host's dungeon (0x014BB200): the host's dungeon is
 // fetched by channel id from the game server (0x01E65290, POST /channel/get_info; channel object
@@ -66,7 +69,7 @@ constexpr std::size_t DescDungeon = 0x08;  // u32 dungeon map id (0x1Dxxxxxx)
 constexpr std::size_t DescPairs = 0x0C;    // 9 x (u32 param id, u32 value)
 constexpr std::size_t PairsSize = 0x48;
 constexpr std::size_t DescValue = 0x54;    // u32, per chalice (100000, 800000, ...)
-constexpr std::size_t DescLayer = 0x58;    // s32, 0-based
+constexpr std::size_t DescLayer = 0x58;    // s32, the altar's layer choice, 0-based
 constexpr std::uint64_t OfflineChannel = 0x8000000000000000ull; // a dungeon never put online
 constexpr std::int32_t MaxLayer = 3;                            // four layers at most
 
@@ -322,6 +325,7 @@ inline LoadPlan PlanGuestLoad(std::uint32_t map, int summon_phase, bool guest, i
 }
 
 // ---- Self-test on one PC: "<channel>:<layer 1-4>" builds that dungeon on a solo Chalice load ----
+// (the layer goes into the descriptor only: the player still appears at the altar's start lamp)
 struct SelfTest {
     std::uint64_t channel = 0;
     std::int32_t layer = 0; // 0-based

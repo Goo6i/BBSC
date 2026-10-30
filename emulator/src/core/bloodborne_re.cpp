@@ -9382,7 +9382,7 @@ void LogBbscRoleTableOnce() {
              RoleMetadataCount - 1, marks);
 }
 
-// ---- Chalice Dungeons together (2026-10-30) -----------------------------------------------------
+// ---- Chalice Dungeons together (2026-10-29) -----------------------------------------------------
 // See core/bbsc_chalice.h for the game code, the plan and the tests. Test 2026-10-29 (host + 2
 // guests, glyph 6s46u7i4 layer 3): a guest without that dungeon fell through the floor every time it
 // was placed at the host - each game built its own selected dungeon on its own last layer.
@@ -9481,7 +9481,7 @@ bool BbscChaliceNetworkReady() {
 }
 
 std::string BbscChaliceText(const Chalice::Descriptor& d) {
-    return fmt::format("dungeon {:#x} (channel {}, layer {})", Chalice::DungeonMap(d),
+    return fmt::format("dungeon {:#x} (channel {}, altar layer {})", Chalice::DungeonMap(d),
                        Chalice::Channel(d), Chalice::Layer(d) + 1);
 }
 
