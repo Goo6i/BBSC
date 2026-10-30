@@ -9383,17 +9383,25 @@ void PS4_SYSV_ABI BbscInGameStepHook(u64, const GuestRegisterSnapshot* registers
     const u8 request_role = ReadValue<u8>(request, LoadRequestRoleOffset);
     const u8 own_before = BbscOwnRole();
     const u8 role = bbsc_own_role.OnLoadStep(phase, state == 6, request_role);
-    const bool written = role != 0 && WriteValue<u8>(request, LoadRequestRoleOffset, role);
+    static const bool keep_role = EnvFlagEnabled("SHADPS4_BBSC_KEEP_ROLE");
+    const u8 to_write = ::Bbsc::Role::RoleToWrite(keep_role, role);
+    const bool written = to_write != 0 && WriteValue<u8>(request, LoadRequestRoleOffset, to_write);
     LOG_INFO(Debug,
              "BBSC role: load step into map {:#x} (summon phase {}, session state {}): request "
              "role {}, own role was {}{}",
              map, phase, state, request_role, own_before,
              written       ? fmt::format(" - BBSC reload, request role set to {}", role)
+             : role != 0 && !keep_role
+                 ? fmt::format(" - BBSC reload, would set role {} (SHADPS4_BBSC_KEEP_ROLE=0)", role)
              : role != 0   ? std::string(" - request role NOT writable")
                            : std::string());
     if (written) {
         BBSC_TIMELINE("SESSION", "role: BBSC reload into {:#x} keeps our summon role {} (the "
                                  "load would have given us 0, the host's role)",
+                      map, role);
+    } else if (role != 0 && !keep_role) {
+        BBSC_TIMELINE("SESSION", "role: BBSC reload into {:#x} gives us 0, the host's role "
+                                 "(SHADPS4_BBSC_KEEP_ROLE=0; our summon role is {})",
                       map, role);
     }
 }
@@ -9814,8 +9822,9 @@ void InstallBbscQuitHook() {
                              "check {:#x} ({})",
                       InGameStepCreateOffset, step_ok, DepartureCheckOffset, check_ok);
         } else {
-            LOG_INFO(Debug, "BBSC role: a guest keeps its summon role through BBSC's reloads "
+            LOG_INFO(Debug, "BBSC role: a guest keeps its summon role through BBSC's reloads {} "
                             "(load step {:#x}, departure check {:#x})",
+                     EnvFlagEnabled("SHADPS4_BBSC_KEEP_ROLE") ? "ON" : "OFF (SHADPS4_BBSC_KEEP_ROLE=0)",
                      InGameStepCreateOffset, DepartureCheckOffset);
         }
     }

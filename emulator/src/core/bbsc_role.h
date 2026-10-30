@@ -42,6 +42,12 @@ constexpr bool DepartureSendsHome(bool leave_running, bool leaver_found,
     return role_mark == 0;
 }
 
+// Switch SHADPS4_BBSC_KEEP_ROLE (on by default). The role BBSC writes into a reload request given
+// the role OnLoadStep returned: off writes nothing, so the request stays as BBSC 0.0.2 leaves it.
+constexpr std::uint8_t RoleToWrite(bool keep_role_switch, std::uint8_t kept) {
+    return keep_role_switch ? kept : 0;
+}
+
 class OwnRoleKeeper {
 public:
     // At the start of the in-game step of a load. Returns the role to put into the load request

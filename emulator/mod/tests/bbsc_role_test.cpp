@@ -22,6 +22,7 @@ void Check(bool ok, const char* what) {
 
 using Bbsc::Role::DepartureSendsHome;
 using Bbsc::Role::OwnRoleKeeper;
+using Bbsc::Role::RoleToWrite;
 constexpr int SummonPhase = 3;
 constexpr int OtherPhase = 4;
 
@@ -75,6 +76,15 @@ void NothingKnownNothingWritten() {
     Check(keeper.OnLoadStep(SummonPhase, true, 0) == 0, "no summon role seen, nothing written");
 }
 
+// The switch SHADPS4_BBSC_KEEP_ROLE=0 must leave every reload request as 0.0.2 does, whatever the
+// keeper has; on, the keeper's answer goes through unchanged.
+void SwitchOffWritesNothing() {
+    Check(RoleToWrite(false, 7) == 0, "switch off: a kept role 7 is not written");
+    Check(RoleToWrite(false, 0) == 0, "switch off: nothing kept, nothing written");
+    Check(RoleToWrite(true, 7) == 7, "switch on: the kept role 7 is written");
+    Check(RoleToWrite(true, 0) == 0, "switch on: nothing kept, nothing written");
+}
+
 } // namespace
 
 int main() {
@@ -83,6 +93,7 @@ int main() {
     LeavesOtherLoadsAlone();
     ForgetsTheRoleWhenTheSessionEnds();
     NothingKnownNothingWritten();
+    SwitchOffWritesNothing();
     std::printf("%s\n", failures == 0 ? "all passed" : "FAILED");
     return failures == 0 ? 0 : 1;
 }
