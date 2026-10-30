@@ -19,6 +19,7 @@
     {"id": "host_dead", "name": "Stay when the host dies", "description": "The guest keeps the session if the host dies", "type": "bool", "default": true, "env": "SHADPS4_BBSC_PERSIST_HOSTDEAD"},
     {"id": "spectate", "name": "Respawn in place", "description": "A dead player respawns / spectates instead of leaving", "type": "bool", "default": true, "env": "SHADPS4_BBSC_SPECTATE"},
     {"id": "full_echoes", "name": "Full echoes", "description": "A guest is paid the host's rate, not half", "type": "bool", "default": true, "env": "SHADPS4_BBSC_FULL_ECHOES"},
+    {"id": "chalice_replayed_kills", "name": "No echoes for dead enemies", "description": "Chalice Dungeons: enemies the host already killed die again when a guest loads in; the guest gets no echoes or drops for them", "type": "bool", "default": true, "env": "SHADPS4_BBSC_CHALICE_REPLAYED_KILLS"},
     {"id": "no_hp_penalty", "name": "No guest HP cut", "description": "Removes the summoned guest's 30% max HP cut", "type": "bool", "default": true, "env": "SHADPS4_BBSC_NO_HP_PENALTY"},
     {"id": "guest_items", "name": "Guest items", "description": "A guest picks up and keeps items", "type": "bool", "default": true, "env": "SHADPS4_BBSC_GUEST_ITEMS"},
     {"id": "solid_npcs", "name": "Solid NPCs", "description": "A guest sees NPCs solid, not as grey ghosts", "type": "bool", "default": true, "env": "SHADPS4_BBSC_SOLID_NPCS"},
