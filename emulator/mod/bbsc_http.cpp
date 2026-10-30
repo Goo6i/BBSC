@@ -524,12 +524,12 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
             BBSC_TIMELINE("JOIN", "HTTP: ringing the sign of user {} - our placement {} sent to it", target,
                      *placement);
         } else {
+            const std::string why =
+                placement ? std::string("known") : "none, " + Core::Bloodborne::GetSeamlessHostPlacementWhyNone();
             LOG_INFO(Mod, "HTTP: ringing a sign - no placement sent (target user {}, placement {})",
-                     target_text.empty() ? std::string("unknown") : target_text,
-                     placement ? "known" : "none");
+                     target_text.empty() ? std::string("unknown") : target_text, why);
             BBSC_TIMELINE("JOIN", "HTTP: ringing a sign - no placement sent (target user {}, placement {})",
-                     target_text.empty() ? std::string("unknown") : target_text,
-                     placement ? "known" : "none");
+                     target_text.empty() ? std::string("unknown") : target_text, why);
         }
         return original_send(request, data, size);
     }
