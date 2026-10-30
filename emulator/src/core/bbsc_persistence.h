@@ -14,7 +14,7 @@ namespace Core::Bbsc {
 // any environment variable, so the build runs straight from a launcher. Everything still only
 // applies to CUSA03173 01.09 (checked where each feature installs). Experimental switches stay
 // off, and so is the boot intro (SHADPS4_BBSC_INTRO=1 brings it back). Setting a variable always wins: "0" turns a default off, any other value turns it on.
-inline constexpr std::array<std::string_view, 35> DefaultOnSwitches{
+inline constexpr std::array<std::string_view, 37> DefaultOnSwitches{
     "SHADPS4_BBSC_SHARED_PROGRESS",     // merge the host's progress into the guest's world (adds only)
     "SHADPS4_BBSC_WARP_TOGETHER",        // the guest follows the host through a lamp warp
     "SHADPS4_BBSC_WORLD_SYNC",           // ...and loads the host's map with the host's world flags
@@ -50,6 +50,8 @@ inline constexpr std::array<std::string_view, 35> DefaultOnSwitches{
     "SHADPS4_BBSC_WORLD_SYNC_ALL",       // the host's flags for every area, not just the one it is in
     "SHADPS4_BBSC_TIMELINE",             // a short bbsc-timeline-*.txt of what happened, next to the logs
     "SHADPS4_BBSC_BELLS_ANYWHERE",       // the kit's bells ring anywhere (Dream too); role / Insight still count
+    "SHADPS4_BBSC_KEEP_ROLE",            // a guest keeps its summon role through BBSC's reloads
+    "SHADPS4_BBSC_CHALICE_TOGETHER",     // a guest following the host into a Chalice loads its dungeon
 };
 
 // False in the vanilla build (CMake BBSC_VANILLA): the emulator carries no BBSC of its own and
