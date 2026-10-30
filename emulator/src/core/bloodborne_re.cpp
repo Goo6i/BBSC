@@ -45,6 +45,7 @@
 #include "core/cpu_patches.h"
 #include "core/debugger.h"
 #include "core/file_format/psf.h"
+#include "core/bbsc_replayed_kill.h"
 #include "core/libraries/np/np_matching2/np_matching2_mm.h"
 #include "core/libraries/np/np_signaling/np_signaling_helpers.h"
 #include "core/libraries/np/np_signaling/np_signaling_bbsc.h"
@@ -843,6 +844,7 @@ std::optional<SummonPlacementDescriptor> bbsc_connect_first_placement;
 // adds the join warp's second, real reload (see BbscWarpJoinEnabled).
 std::atomic<bool> bbsc_cross_map_join{false};
 bool BbscConnectFirstEnabled();
+void NoteBbscReplayLoad(const char* what); // see "Replayed Chalice kills"
 bool BbscConnectFirstPlacementFresh(); // prepare reply received within the timeout
 std::atomic<u32> pending_summon_reload_map{};
 std::atomic<u32> pending_summon_reload_state_map{};
@@ -3837,6 +3839,9 @@ void TickBbscReinsertV8() {
     }
     LOG_INFO(Debug, "BBSC reinsert v8: restarted {} remote player insert task(s) at FirstSyncWait",
              restarted);
+    if (restarted > 0) {
+        NoteBbscReplayLoad("BBSC reinsert"); // see "Replayed Chalice kills"
+    }
     LogBbscSessionShape("v8 restarted", true);
 }
 
@@ -13192,11 +13197,81 @@ constexpr u64 PlayerAddEchoesOffset = 0x018FC600;
 constexpr int BbscEchoPathLogLimit = 300;
 std::atomic<int> bbsc_echo_path_logged{0};
 
+// ---- Replayed Chalice kills (2026-10-30, core/bbsc_replayed_kill.h) -----------------------------
+// The host's earlier kills die again in a guest's load of a Chalice Dungeon and were paid every
+// time (10-30 r7im +167237 echoes at one follow; 10-29 Ali the same seven enemies twice) with BBSC
+// guest drops rolled for them too. Each guest load in the host's world, and each BBSC reinsert that
+// restarts the host's player insert, starts a replay window; a death in it gets the game's own
+// no-reward mark 0x200000 (byte +0x1E3 bit 0x20), as replayed deaths do outside the Chalice
+// Dungeons. Switch SHADPS4_BBSC_CHALICE_REPLAYED_KILLS (on).
+std::atomic<s64> bbsc_replay_load_ms{-1};
+std::atomic<const char*> bbsc_replay_load_what{"none"};
+std::atomic<bool> bbsc_replay_window_marked{false};
+
+bool BbscReplayedKillsEnabled() {
+    // On unless set to "0", as for a DefaultOnSwitches entry. It is read here instead of listed
+    // there so this change does not touch that array, which other fixes extend too (the timeline's
+    // "Switched off:" line does not show it; the startup log line does).
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_BBSC_CHALICE_REPLAYED_KILLS");
+        return value == nullptr || value[0] == '\0' || std::string_view{value} != "0";
+    }();
+    return enabled;
+}
+
+void NoteBbscReplayLoad(const char* what) {
+    if (GetSessionState() != ::Bbsc::ReplayedKill::InHostsWorldState) {
+        return; // only a guest's loads into a host's world replay the host's kills
+    }
+    bbsc_replay_load_what.store(what, std::memory_order_relaxed);
+    bbsc_replay_window_marked.store(false, std::memory_order_relaxed);
+    bbsc_replay_load_ms.store(SteadyNowMs(), std::memory_order_release);
+}
+
+void MarkBbscReplayedKill(u64 dead) {
+    namespace RK = ::Bbsc::ReplayedKill;
+    if (image_base == 0 || !ReadablePointer(dead, 0x1E8) || dead == GetLocalPlayerCharacter()) {
+        return;
+    }
+    RK::Death death;
+    death.enabled = BbscReplayedKillsEnabled();
+    death.player_type = GetLocalPlayerType();
+    death.session_state = GetSessionState();
+    death.map = GetCurrentPackedMap();
+    death.flags = ReadValue<u32>(dead, 0x1E1);
+    death.now_ms = SteadyNowMs();
+    death.load_ms = bbsc_replay_load_ms.load(std::memory_order_acquire);
+    const RK::Verdict verdict = RK::Judge(death);
+    if (!RK::ShouldMark(verdict)) {
+        return;
+    }
+    const char* what = bbsc_replay_load_what.load(std::memory_order_relaxed);
+    if (!HasMemoryAccess(dead + 0x1E3, 1, MemoryProt::CpuWrite)) {
+        LOG_WARNING(Debug, "BBSC replayed kill: chr {:#x} died {} ms after {} but its flags are "
+                           "not writable - paid as before",
+                    dead, death.now_ms - death.load_ms, what);
+        return;
+    }
+    // Only byte +0x1E3 of the 5-byte field: the dword's bit 0x200000 is its bit 0x20.
+    WriteValue<u8>(dead, 0x1E3, static_cast<u8>(RK::Mark(death.flags) >> 16));
+    LOG_INFO(Debug,
+             "BBSC replayed kill: chr {:#x} died {} ms after {} in the Chalice Dungeon (map {:#x}, "
+             "flags {:#x} -> {:#x}) - {}; no echoes or drop for it",
+             dead, death.now_ms - death.load_ms, what, death.map, death.flags & 0xFFFFFFu,
+             ReadValue<u32>(dead, 0x1E1) & 0xFFFFFFu, RK::Describe(verdict));
+    if (!bbsc_replay_window_marked.exchange(true, std::memory_order_relaxed)) {
+        BBSC_TIMELINE("ECHOES", "replayed kills: enemies the host had already killed die again in "
+                                "our load ({} ms after {}) - no echoes or drops for them",
+                      death.now_ms - death.load_ms, what);
+    }
+}
+
 void PS4_SYSV_ABI BbscEchoPathHook(u64 tag, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr) {
         return;
     }
     if (tag == 0) {
+        MarkBbscReplayedKill(registers->rdi);    // first: the game's gate and the drop read it
         NoteBbscGuestEnemyDeath(registers->rdi); // before the log limit below
     }
     const s32 session_state = GetSessionState();
@@ -13330,6 +13405,10 @@ void InstallBbscEchoPathHooks() {
         }
     }
     LOG_INFO(Debug, "BBSC echo path: {} of 4 reward observers installed", installed);
+    LOG_INFO(Debug, "BBSC replayed kills: {} - a guest's deaths within {} ms of its load in the "
+                    "host's Chalice Dungeon, or of a BBSC reinsert, get the game's no-reward mark",
+             BbscReplayedKillsEnabled() ? "on" : "off (SHADPS4_BBSC_CHALICE_REPLAYED_KILLS=0)",
+             ::Bbsc::ReplayedKill::WindowMs);
 }
 
 // Every change of the local blood echo total while a session is live, with the player type, so a
@@ -16019,6 +16098,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         RestoreBbscSignTypeBeforeReloadFinish();
     }
     if (site.offset == 0x0178D9C0) {
+        NoteBbscReplayLoad("our load in the host's world"); // see "Replayed Chalice kills"
         RestoreBbscOwnWorldAtLoad(); // only when the load is home (see "Own world journal")
         ApplyBbscHostWorldFlagsAtLoad();
         ApplyBbscGuestLootViewAtLoad();
