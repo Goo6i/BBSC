@@ -25,6 +25,7 @@
     {"id": "death_penalty", "name": "Bloodstain on death", "description": "A kept death still drops a bloodstain and echoes", "type": "bool", "default": true, "env": "SHADPS4_BBSC_DEATH_PENALTY"},
     {"id": "free_bell", "name": "Free Beckoning Bell", "description": "The bell costs no Insight", "type": "bool", "default": true, "env": "SHADPS4_BBSC_FREE_BELL"},
     {"id": "bells_anywhere", "name": "Bells anywhere", "description": "The kit's bells ring anywhere, the Hunter's Dream included (your role, Insight and being online still count)", "type": "bool", "default": true, "env": "SHADPS4_BBSC_BELLS_ANYWHERE"},
+    {"id": "keep_role", "name": "Guests keep their role", "description": "A guest keeps its co-op role through follows and rejoins, so one guest leaving does not send the others home", "type": "bool", "default": true, "env": "SHADPS4_BBSC_KEEP_ROLE"},
     {"id": "five_hunters", "name": "Five hunters", "description": "The host may summon up to 4 guests", "type": "bool", "default": true, "env": "SHADPS4_BBSC_FIVE_HUNTERS"},
     {"id": "messages", "name": "Co-op texts", "description": "Texts that fit seamless play (no \"Returning to your world\")", "type": "bool", "default": true, "env": "SHADPS4_BBSC_MESSAGES"},
     {"id": "load_cover", "name": "Black fade on joins", "description": "The guest's loads happen behind a black fade", "type": "bool", "default": true, "env": "SHADPS4_BBSC_LOAD_COVER"},
