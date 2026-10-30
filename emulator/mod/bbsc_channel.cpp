@@ -28,6 +28,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -108,6 +109,34 @@ s64 NowMs() {
     return static_cast<s64>(GetTickCount64());
 }
 
+// ---- Watch (probe, 2026-10-30) ------------------------------------------------------------------
+// The game's own P2P datagrams per player, logged every 10 s. On 2026-10-30 a host's "send backlog"
+// (reliable packets one member never confirms) grew from a guest's follow load on, while that
+// guest's game stayed online; these counts say whether the guest's game still got the host's
+// datagrams and still answered, and the header bytes show what it answered.
+constexpr s64 WatchReportMs = 10'000;
+constexpr size_t WatchHeadBytes = 32;
+
+struct Watch {
+    u16 vport = 0;             // host order
+    u32 sent = 0;
+    u32 sent_bytes = 0;
+    u32 heard = 0;
+    u32 heard_bytes = 0;
+    s64 last_sent_ms = 0;
+    s64 last_heard_ms = 0;
+    s64 max_sent_gap_ms = 0;
+    s64 max_heard_gap_ms = 0;
+    bool active_last_window = false;
+    u8 sent_head[WatchHeadBytes]{};
+    u32 sent_head_len = 0;
+    u8 heard_head[WatchHeadBytes]{};
+    u32 heard_head_len = 0;
+};
+
+std::mutex watch_mutex;
+std::map<u64, Watch> watch; // key: addr << 16 | port (both network order)
+
 std::string AddressText(u32 addr, u16 port) {
     const auto* b = reinterpret_cast<const u8*>(&addr);
     return fmt::format("{}.{}.{}.x:{}", b[0], b[1], b[2], static_cast<u16>((port >> 8) | (port << 8)));
@@ -142,10 +171,91 @@ void NoteGameAddress(const void* addr, u32 len, const char* how) {
     NotePeer(in.sin_addr, in.sin_port, how);
 }
 
+void WatchDatagram(const void* addr, u32 len, const void* data, s32 size, bool sent) {
+    if (addr == nullptr || len < sizeof(OrbisSockaddrIn) || data == nullptr || size <= 0) {
+        return;
+    }
+    OrbisSockaddrIn in{};
+    std::memcpy(&in, addr, sizeof(in));
+    if (in.sin_family != OrbisAfInet || in.sin_vport == 0 ||
+        in.sin_vport == static_cast<u16>((ChannelVport >> 8) | (ChannelVport << 8))) {
+        return;
+    }
+    const u64 key = (static_cast<u64>(in.sin_addr) << 16) | in.sin_port;
+    const s64 now = NowMs();
+    const u32 head = static_cast<u32>(std::min<size_t>(static_cast<size_t>(size), WatchHeadBytes));
+    std::scoped_lock lock{watch_mutex};
+    Watch& w = watch[key];
+    w.vport = static_cast<u16>((in.sin_vport >> 8) | (in.sin_vport << 8));
+    if (sent) {
+        if (w.last_sent_ms != 0) {
+            w.max_sent_gap_ms = std::max(w.max_sent_gap_ms, now - w.last_sent_ms);
+        }
+        w.last_sent_ms = now;
+        ++w.sent;
+        w.sent_bytes += static_cast<u32>(size);
+        std::memcpy(w.sent_head, data, head);
+        w.sent_head_len = head;
+    } else {
+        if (w.last_heard_ms != 0) {
+            w.max_heard_gap_ms = std::max(w.max_heard_gap_ms, now - w.last_heard_ms);
+        }
+        w.last_heard_ms = now;
+        ++w.heard;
+        w.heard_bytes += static_cast<u32>(size);
+        std::memcpy(w.heard_head, data, head);
+        w.heard_head_len = head;
+    }
+}
+
+std::string HexBytes(const u8* data, u32 size) {
+    std::string out;
+    for (u32 i = 0; i < size; ++i) {
+        out += fmt::format("{}{:02x}", i == 0 ? "" : " ", data[i]);
+    }
+    return out.empty() ? std::string("-") : out;
+}
+
+void ReportWatch() {
+    static s64 next_ms = 0;
+    const s64 now = NowMs();
+    if (now < next_ms) {
+        return;
+    }
+    next_ms = now + WatchReportMs;
+    // Copied out first: the game's send and receive wait on this lock, the log write should not.
+    std::vector<std::pair<u64, Watch>> report;
+    {
+        std::scoped_lock lock{watch_mutex};
+        for (auto& [key, w] : watch) {
+            const bool active = w.sent != 0 || w.heard != 0;
+            if (active || w.active_last_window) {
+                report.emplace_back(key, w);
+            }
+            w.active_last_window = active;
+            w.sent = w.sent_bytes = w.heard = w.heard_bytes = 0;
+            w.max_sent_gap_ms = w.max_heard_gap_ms = 0;
+            w.sent_head_len = w.heard_head_len = 0;
+        }
+    }
+    for (const auto& [key, w] : report) {
+        LOG_INFO(Mod,
+                 "P2P watch: {} vport {} - last 10 s the game sent {} ({} bytes, longest gap {} ms), "
+                 "heard {} ({} bytes, longest gap {} ms); last sent {} ms ago, last heard {} ms ago; "
+                 "last sent [{}]; last heard [{}]",
+                 AddressText(static_cast<u32>(key >> 16), static_cast<u16>(key)), w.vport, w.sent,
+                 w.sent_bytes, w.max_sent_gap_ms, w.heard, w.heard_bytes, w.max_heard_gap_ms,
+                 w.last_sent_ms != 0 ? now - w.last_sent_ms : -1,
+                 w.last_heard_ms != 0 ? now - w.last_heard_ms : -1,
+                 HexBytes(w.sent_head, w.sent_head_len), HexBytes(w.heard_head, w.heard_head_len));
+    }
+}
+
 s32 PS4_SYSV_ABI Sendto(s32 s, const void* buf, u64 len, s32 flags, const void* addr, u32 addrlen) {
     const s32 r = original_sendto(s, buf, len, flags, addr, addrlen);
     if (r > 0 && s != channel_socket) {
         NoteGameAddress(addr, addrlen, "game sends to it");
+        WatchDatagram(addr, addrlen, buf, r, true);
     }
     return r;
 }
@@ -154,6 +264,7 @@ s32 PS4_SYSV_ABI Recvfrom(s32 s, void* buf, u64 len, s32 flags, void* addr, u32*
     const s32 r = original_recvfrom(s, buf, len, flags, addr, addrlen);
     if (r > 0 && addrlen != nullptr && s != channel_socket) {
         NoteGameAddress(addr, *addrlen, "game hears from it");
+        WatchDatagram(addr, *addrlen, buf, r, false);
     }
     return r;
 }
@@ -247,6 +358,7 @@ DWORD WINAPI ChannelThread(void*) {
     int failures = 0;
     s64 next_report_ms = NowMs() + 60'000;
     for (;;) {
+        ReportWatch();
         const s32 s = channel_socket;
         if (s < 0) {
             bool any = false;
