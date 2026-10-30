@@ -12,6 +12,7 @@
 namespace Core::Bloodborne {
 
 std::optional<std::string> GetSeamlessHostPlacementHeader();
+std::string GetSeamlessHostPlacementWhyNone(); // for the log when the header is empty
 bool SetSeamlessHostPlacementHeader(std::string_view value);
 void ClearSeamlessHostPlacementHeader();
 // BBSC timeline: one line in this run's bbsc-timeline-*.txt ("kind" like NET, RELAY, JOIN). Any
