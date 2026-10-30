@@ -10505,11 +10505,19 @@ void TickBbscSendBacklog() {
         return;
     }
     s32 total = ReadValue<s32>(manager, 0x1B0);
+    // Probe (2026-10-30): each queue's count, and the first busy queue's bytes, for decoding later.
+    std::string per_queue = fmt::format("+0x1B0 {}", total);
+    u64 busy_queue = 0;
     u64 node = ReadValue<u64>(head, 0);
     for (int i = 0; i < 64 && node != head && ReadablePointer(node, 0x18); ++i) {
         const u64 queue = ReadValue<u64>(node, 0x10);
         if (ReadablePointer(queue, 0x34)) {
-            total += ReadValue<s32>(queue, 0x30);
+            const s32 count = ReadValue<s32>(queue, 0x30);
+            total += count;
+            per_queue += fmt::format(", node {:#x} queue {:#x}: {}", node, queue, count);
+            if (busy_queue == 0 && count > 0) {
+                busy_queue = queue;
+            }
         }
         node = ReadValue<u64>(node, 0);
     }
@@ -10527,6 +10535,15 @@ void TickBbscSendBacklog() {
         BBSC_TIMELINE("NET", "send backlog: {} reliable packets waiting for a member that does not "
                     "answer (session state {}; vanilla ends the session at 1001, BBSC at 30000)",
                     total, GetSessionState());
+        std::string bytes;
+        if (busy_queue != 0 && ReadablePointer(busy_queue, 0x80)) {
+            for (u64 off = 0; off < 0x80; off += 8) {
+                bytes += fmt::format("{}{:016x}", off == 0 ? "" : " ", ReadValue<u64>(busy_queue, off));
+            }
+        }
+        LOG_INFO(Debug, "BBSC send backlog (probe): manager {:#x} list {:#x} - {}; first busy queue "
+                        "+0x00..+0x7f (u64): {}",
+                 manager, head, per_queue, bytes.empty() ? std::string("-") : bytes);
     }
 }
 
