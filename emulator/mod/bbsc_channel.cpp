@@ -25,6 +25,11 @@
 //   0x053E52D0 sceNpSignalingGetConnectionStatus
 // Switch SHADPS4_BBSC_P2P_CHANNEL (Mods tab, on). Datagrams can be lost: every BBSC packet was
 // made for the emulator's UDP signaling first and is re-sent or repeated by its sender.
+//
+// The same sceNetSendto wrapper cuts the game's own datagrams over DatagramSplit::DefaultLimit at
+// record boundaries (core/bbsc_datagram_split.h), so none of them needs IP fragmentation: some
+// mobile lines deliver only the first fragment, and the game's reliable channel then re-sends the
+// lost datagram forever. Switch SHADPS4_BBSC_SPLIT_DATAGRAMS (on), independent of the channel.
 
 #include <windows.h>
 
@@ -38,6 +43,8 @@
 
 #include "common/logging/log.h"
 #include "common/types.h"
+#include "core/bbsc_datagram_split.h"
+#include "core/bloodborne_re.h"
 
 namespace BbscMod {
 u64 EbootAddress(); // bbsc_mod.cpp
@@ -142,7 +149,102 @@ void NoteGameAddress(const void* addr, u32 len, const char* how) {
     NotePeer(in.sin_addr, in.sin_port, how);
 }
 
+// ---- The game's datagrams, cut at record boundaries (core/bbsc_datagram_split.h) -------------
+
+constexpr size_t SplitLimit = Bbsc::DatagramSplit::DefaultLimit;
+constexpr s64 SplitReportMs = 30'000;
+
+std::atomic<bool> split_on{false};
+std::atomic<bool> split_first{true};
+std::atomic<s64> split_report_ms{0};
+std::atomic<u32> split_datagrams{0}; // over the limit, went out in pieces (since the last report)
+std::atomic<u32> split_pieces{0};
+std::atomic<u32> split_as_is{0};      // over the limit but not a run of records: sent unchanged
+std::atomic<u32> split_oversized{0};  // records over the limit by themselves (each sent alone)
+std::atomic<u32> split_largest{0};    // largest record seen in a split datagram
+
+bool SwitchedOff(const char* name) {
+    const char* env = std::getenv(name);
+    return env != nullptr && (env[0] == '0' || env[0] == 'f' || env[0] == 'F');
+}
+
+// The game's datagram goes to another player (a P2P address, not BBSC's own vport).
+bool ToPlayer(const void* addr, u32 len) {
+    if (addr == nullptr || len < sizeof(OrbisSockaddrIn)) {
+        return false;
+    }
+    OrbisSockaddrIn in{};
+    std::memcpy(&in, addr, sizeof(in));
+    return in.sin_family == OrbisAfInet && in.sin_vport != 0 &&
+           in.sin_vport != static_cast<u16>((ChannelVport >> 8) | (ChannelVport << 8));
+}
+
+void ReportSplit(u64 len, size_t pieces) {
+    if (split_first.exchange(false)) {
+        LOG_INFO(Mod, "datagram split: a {} byte datagram of the game went out as {} (limit {})",
+                 len, pieces, SplitLimit);
+        Core::Bloodborne::BbscTimelineEvent(
+            "NET", fmt::format("datagram split: a {} byte datagram of the game went out as {} of at "
+                               "most {} bytes, so no IP fragment can be lost on the way",
+                               len, pieces, SplitLimit));
+    }
+    const s64 now = NowMs();
+    s64 last = split_report_ms.load();
+    if (now - last < SplitReportMs || !split_report_ms.compare_exchange_strong(last, now)) {
+        return;
+    }
+    LOG_INFO(Mod,
+             "datagram split: last 30 s {} of the game's datagrams over {} bytes went out as {} "
+             "(largest record {} bytes, {} record(s) over the limit sent alone); {} sent as is (not "
+             "the game's records)",
+             split_datagrams.exchange(0), SplitLimit, split_pieces.exchange(0),
+             split_largest.exchange(0), split_oversized.exchange(0), split_as_is.exchange(0));
+}
+
+// Sends the game's datagram in pieces when it is over the limit and a run of the game's records.
+// Returns true when it did (the result is then in *result: the datagram's length, or the error of
+// the first piece when nothing went out).
+bool SendSplit(s32 s, const void* buf, u64 len, s32 flags, const void* addr, u32 addrlen,
+               s32* result) {
+    if (!split_on || len <= SplitLimit || buf == nullptr || s == channel_socket ||
+        !ToPlayer(addr, addrlen)) {
+        return false;
+    }
+    const auto* bytes = static_cast<const u8*>(buf);
+    const Bbsc::DatagramSplit::Plan plan =
+        Bbsc::DatagramSplit::PlanSplit(bytes, static_cast<size_t>(len), SplitLimit);
+    if (!plan.records || plan.pieces.size() < 2) {
+        if (!plan.records) {
+            ++split_as_is;
+        }
+        return false;
+    }
+    for (size_t i = 0; i < plan.pieces.size(); ++i) {
+        const Bbsc::DatagramSplit::Piece& piece = plan.pieces[i];
+        const s32 r = original_sendto(s, bytes + piece.offset, piece.size, flags, addr, addrlen);
+        if (r < 0 && i == 0) {
+            *result = r; // nothing went out: the game sees the error, as without the split
+            return true;
+        }
+        // A later piece lost is a lost datagram: the game's reliable channel sends it again.
+    }
+    ++split_datagrams;
+    split_pieces += static_cast<u32>(plan.pieces.size());
+    split_oversized += static_cast<u32>(plan.oversized);
+    for (u32 seen = split_largest.load(); plan.largest_record > seen &&
+                                          !split_largest.compare_exchange_weak(
+                                              seen, static_cast<u32>(plan.largest_record));) {
+    }
+    ReportSplit(len, plan.pieces.size());
+    NoteGameAddress(addr, addrlen, "game sends to it");
+    *result = static_cast<s32>(len);
+    return true;
+}
+
 s32 PS4_SYSV_ABI Sendto(s32 s, const void* buf, u64 len, s32 flags, const void* addr, u32 addrlen) {
+    if (s32 split = 0; SendSplit(s, buf, len, flags, addr, addrlen, &split)) {
+        return split;
+    }
     const s32 r = original_sendto(s, buf, len, flags, addr, addrlen);
     if (r > 0 && s != channel_socket) {
         NoteGameAddress(addr, addrlen, "game sends to it");
@@ -344,15 +446,30 @@ u32 P2PChannelPeerCount() {
 }
 
 void StartP2PChannel() {
-    if (const char* env = std::getenv("SHADPS4_BBSC_P2P_CHANNEL");
-        env != nullptr && (env[0] == '0' || env[0] == 'f' || env[0] == 'F')) {
+    const bool channel = !SwitchedOff("SHADPS4_BBSC_P2P_CHANNEL");
+    const bool split = !SwitchedOff("SHADPS4_BBSC_SPLIT_DATAGRAMS");
+    if (!channel) {
         LOG_INFO(Mod, "P2P channel: off (switch)");
+    }
+    if (!channel && !split) {
+        LOG_INFO(Mod, "datagram split: off (SHADPS4_BBSC_SPLIT_DATAGRAMS=0) - the game's datagrams "
+                      "go out as the game made them");
         return;
     }
     if (!Swap<SendtoFn>(SlotSendto, &Sendto, original_sendto, "Sendto") ||
         !Swap<RecvfromFn>(SlotRecvfrom, &Recvfrom, original_recvfrom, "Recvfrom")) {
         LOG_ERROR(Mod, "P2P channel: an import slot was never filled - channel off");
         return;
+    }
+    split_on = split;
+    LOG_INFO(Mod, "datagram split: {}",
+             split ? fmt::format("on - the game's datagrams over {} bytes go out cut at record "
+                                 "boundaries, so none needs IP fragmentation",
+                                 SplitLimit)
+                   : std::string("off (SHADPS4_BBSC_SPLIT_DATAGRAMS=0) - the game's datagrams go "
+                                 "out as the game made them"));
+    if (!channel) {
+        return; // the wrappers stay for the split only
     }
     Swap<ConnectionStatusFn>(SlotConnectionStatus, &ConnectionStatus, original_connection_status,
                              "ConnectionStatus");
