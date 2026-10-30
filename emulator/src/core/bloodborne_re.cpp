@@ -41,6 +41,7 @@
 #include "core/bbsc_memscan.h"
 #include "core/bbsc_persistence.h"
 #include "core/bbsc_cinematic.h"
+#include "core/bbsc_host_placement.h"
 #include "imgui/bbsc_loading_layer.h"
 #include "core/cpu_patches.h"
 #include "core/debugger.h"
@@ -834,7 +835,8 @@ struct HostPlacementRewriteRecord {
 
 thread_local HostPlacementRewriteRecord host_placement_rewrite{};
 std::mutex seamless_placement_mutex;
-std::optional<SummonPlacementDescriptor> seamless_host_placement;
+// What our rings carry (core/bbsc_host_placement.h): our own position, kept at each summon build.
+::Bbsc::HostPlacement::ClaimPlacement<SummonPlacementDescriptor> seamless_host_placement;
 std::optional<SummonPlacementDescriptor> seamless_received_host_placement;
 bool seamless_received_host_placement_consumed{};
 // BBSC connect-first: host placement from the prepare reply, kept until the join load uses it.
@@ -1283,16 +1285,23 @@ void RefreshSeamlessLocalPlacement() {
         return;
     }
     std::scoped_lock lock{seamless_placement_mutex};
-    seamless_host_placement = placement;
+    seamless_host_placement.OnOwnRead(placement, result);
 }
 
 void ApplyCrossMapSummonHostPlacement(const GuestRegisterSnapshot& registers) {
     host_placement_rewrite = {};
     host_placement_rewrite.result = "invalid_prepared";
     host_placement_rewrite.prepared = registers.rsi;
+    // The claim of this ring goes out right after the build: it carries our position as read now,
+    // same map or not (2026-10-29: after a same-map build every later ring carried none for
+    // minutes and the second guest's join failed twice; core/bbsc_host_placement.h).
+    SummonPlacementDescriptor own{};
+    std::string_view own_result;
+    const bool own_read = ReadLocalSummonPlacement(own, own_result);
     {
         std::scoped_lock lock{seamless_placement_mutex};
-        seamless_host_placement.reset();
+        seamless_host_placement.OnSummonBuild(
+            own_read ? std::optional<SummonPlacementDescriptor>{own} : std::nullopt, own_result);
     }
 
     const u64 prepared = registers.rsi;
@@ -1308,9 +1317,11 @@ void ApplyCrossMapSummonHostPlacement(const GuestRegisterSnapshot& registers) {
         host_placement_rewrite.result = "invalid_map";
         return;
     }
-    if (!ReadLocalSummonPlacement(host, host_placement_rewrite.result)) {
+    if (!own_read) {
+        host_placement_rewrite.result = own_result;
         return;
     }
+    host = own;
     if (host_placement_rewrite.candidate.packed_region == host.packed_region) {
         host_placement_rewrite.result = "same_map";
         return;
@@ -1319,10 +1330,6 @@ void ApplyCrossMapSummonHostPlacement(const GuestRegisterSnapshot& registers) {
     if (!WriteValue(prepared, 0x04, host)) {
         host_placement_rewrite.result = "write_rejected";
         return;
-    }
-    {
-        std::scoped_lock lock{seamless_placement_mutex};
-        seamless_host_placement = host;
     }
     host_placement_rewrite.result = "applied";
 }
@@ -17058,11 +17065,16 @@ std::string CapBbscAreaListRequest(std::string_view path, std::string& body) {
     return summary;
 }
 
+std::string GetSeamlessHostPlacementWhyNone() {
+    std::scoped_lock lock{seamless_placement_mutex};
+    return seamless_host_placement.WhyNone();
+}
+
 std::optional<std::string> GetSeamlessHostPlacementHeader() {
     std::optional<SummonPlacementDescriptor> placement;
     {
         std::scoped_lock lock{seamless_placement_mutex};
-        placement = seamless_host_placement;
+        placement = seamless_host_placement.ForClaim();
     }
     if (!placement.has_value()) {
         return std::nullopt;
